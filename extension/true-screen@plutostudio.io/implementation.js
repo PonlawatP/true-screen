@@ -579,7 +579,7 @@ export default class TrueScreenImplementation {
             directions,
             flags: Meta.BarrierFlags.NONE,
         });
-        const entry = {barrier, spec, hitId: 0, blockedEventId: null};
+        const entry = {barrier, spec, hitId: 0};
         entry.hitId = barrier.connect('hit', (_barrier, event) => {
             this._onBarrierHit(entry, event);
         });
@@ -638,10 +638,6 @@ export default class TrueScreenImplementation {
 
         const monitors = monitorSnapshot();
         const {spec, barrier} = entry;
-        if (entry.blockedEventId !== null &&
-            entry.blockedEventId === event.event_id)
-            return;
-
         const vertical = spec.vertical;
         const normalDelta = vertical ? event.dx : event.dy;
         let direction = null;
@@ -699,6 +695,9 @@ export default class TrueScreenImplementation {
             targetProbe.y,
         );
 
+        // Mutter reuses an event sequence while the pointer slides along a
+        // barrier. Re-evaluate its current coordinate on every hit; a blocked
+        // segment must not latch the sequence after it reaches a mapped one.
         const orthogonalCoordinate = vertical ? event.y : event.x;
         const barrierAction = barrierActionAtCoordinate(
             this._edgeBarrierActions,
@@ -714,7 +713,6 @@ export default class TrueScreenImplementation {
         }
 
         const blockPointer = () => {
-            entry.blockedEventId = event.event_id ?? null;
             this._routeAttempts++;
             this._barrierHits++;
             this._blockedEdgeHits++;
@@ -759,7 +757,9 @@ export default class TrueScreenImplementation {
             skipScreenGaps: this._layout.skipScreenGaps === true,
             sourceIndex: source.index,
             sourceCoordinate: {x: event.x, y: event.y},
-            delta: {x: event.dx, y: event.dy},
+            // The barrier identifies the crossed axis. Tangential motion can
+            // dominate a diagonal swipe without changing which edge was hit.
+            delta: vertical ? {x: normalDelta, y: 0} : {x: 0, y: normalDelta},
             edgeThreshold: 12,
             inset: crossingInset,
         });
@@ -866,6 +866,14 @@ export default class TrueScreenImplementation {
             if (routeRecord)
                 routeRecord.warpRefused = 'invalid-destination';
             return false;
+        }
+
+        // A new route supersedes any previous screen's guard, even when
+        // native barrier routing does not need a new one. Guard restores
+        // themselves pass no route record and must keep their active guard.
+        if (routeRecord) {
+            this._cancelGuardRestore();
+            this._warpGuard = null;
         }
 
         const {x: targetX, y: targetY} = targetPoint;

@@ -531,6 +531,55 @@ export async function run() {
             targetPhysical.y) / targetPhysical.height * target.height,
     'Gap crossing did not preserve physical height');
 
+    // A native barrier event sequence continues while sliding along the edge.
+    // A blocked segment must not latch the whole sequence after entering a
+    // mapped segment, including a steep diagonal push against a vertical edge.
+    GLib.file_set_contents(
+        GLib.build_filenamev([configDir, 'layout.json']),
+        JSON.stringify({...blockingLayout, skipScreenGaps: true}),
+    );
+    implementation._loadLayout();
+    await delay(100);
+    const slidingEntry = {
+        spec: {vertical: true},
+        barrier: {release() {}},
+    };
+    const seamX = source.x + source.width;
+    const closedY = source.y + 10;
+    const slideY = source.y + source.height / 3;
+    implementation._warpGuard = null;
+    implementation._ignoreMotionUntil = 0;
+    implementation._lastMotion = {
+        x: seamX - 2, y: closedY, monitorIndex: source.index,
+    };
+    implementation._onBarrierHit(slidingEntry, {
+        event_id: 987654, x: seamX, y: closedY, dx: 2, dy: -20,
+    });
+    await Scripting.waitLeisure();
+    expect(implementation._lastRoute.action === 'block',
+        'Sliding regression did not start on a closed edge');
+    implementation._onBarrierHit(slidingEntry, {
+        event_id: 987654, x: seamX, y: slideY, dx: 2, dy: -20,
+    });
+    await Scripting.waitLeisure();
+    await delay(40);
+    expect(implementation._lastRoute.action === 'warp' &&
+        implementation._lastRoute.targetIndex === target.index,
+    'Sliding the same event sequence onto a mapped edge remained stuck');
+
+    // A new native crossing supersedes a guard from an earlier fallback warp.
+    implementation._warpGuard = {
+        sourceIndex: target.index, targetIndex: source.index,
+        direction: 'left', x: seamX - 2, y: sourceY,
+        expiresAt: GLib.get_monotonic_time() + 250_000,
+    };
+    implementation._queueGuardRestore(implementation._warpGuard);
+    implementation._warpAndRemember(target.x + 20, gapY, target.index,
+        {sourceIndex: source.index, direction: 'right'}, false);
+    expect(implementation._warpGuard === null &&
+        implementation._pendingGuardRestoreSourceId === 0,
+    'New crossing retained a stale guard or queued restore from the previous screen');
+
     const result = {
         passed: true,
         activeMonitors: monitors.length,

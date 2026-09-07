@@ -54,6 +54,13 @@ related_states: []
 
 ## Edge Cases
 
+- Native barrier event IDs may span both blocked and mapped segments. Each hit
+  re-evaluates its current coordinate, using the barrier normal for direction
+  even when tangential motion dominates a diagonal swipe.
+- A new route cancels the previous route's post-warp guard and pending restore,
+  including native crossings that do not create a replacement guard. A restore
+  of the current guard preserves that guard.
+
 - If Mutter identities and Shell logical monitors are temporarily inconsistent
   during display wake, routing fails safe and a later lifecycle retry rebuilds
   the matching layout.
@@ -103,3 +110,5 @@ related_states: []
 | 2026-08-28 | Passed Mutter logical geometry into profile activation so overlapping physical monitors auto-align before pointer routing loads; status: active pending physical three-monitor verification. |
 
 | 2026-09-07 | Added optional nearest-screen gap crossing with physical-coordinate preservation, occlusion-aware barriers, and native fallback target guards; unit and headless Shell coverage; status: stable for gap-crossing scope. Physical lock/resume cycling remains a prior manual verification item. |
+
+| 2026-09-07 | Fixed continuous edge sliding and chained crossings: removed blocked-event latching, routed diagonal native hits by barrier normal, and cleared superseded guards/restores. Headless regressions cover a single event sequence moving from blocked to mapped and stale guard replacement; status: stable. |
