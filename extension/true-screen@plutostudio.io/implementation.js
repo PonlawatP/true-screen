@@ -116,6 +116,15 @@ function monitorIdentitiesFromState(result) {
 export default class TrueScreenImplementation {
     enable() {
         this._enabled = true;
+        this._windowGrabActive = false;
+        this._windowMoveActive = false;
+        this._dragRoutingFailed = false;
+        this._routingEpoch = 0;
+        this._warpFailureUntil = 0;
+        this._grabBeginId = global.display.connect('grab-op-begin', (_display, _window, op) =>
+            this._setWindowGrabActive(true, op));
+        this._grabEndId = global.display.connect('grab-op-end', () =>
+            this._setWindowGrabActive(false));
         this._motionTrackingEnabled = true;
         this._motionEvents = 0;
         this._monitorTransitions = 0;
@@ -196,6 +205,10 @@ export default class TrueScreenImplementation {
 
     disable() {
         this._enabled = false;
+        this._routingEpoch++;
+        global.display.disconnect(this._grabBeginId);
+        global.display.disconnect(this._grabEndId);
+        this._cancelPendingRouting();
 
         if (this._eventFilterId) {
             Clutter.Event.remove_filter(this._eventFilterId);
@@ -257,6 +270,10 @@ export default class TrueScreenImplementation {
             lastRelativeMotionProbe: this._lastRelativeMotionProbe,
             layoutLoaded: this._layout !== null,
             routingEnabled: this._layout?.enabled === true,
+            windowGrabActive: this._windowGrabActive,
+            routingSuspendedForWindowGrab: this._routingPausedForGrab(),
+            dragRoutingFailed: this._dragRoutingFailed,
+            grabWatchers: {begin: Boolean(this._grabBeginId), end: Boolean(this._grabEndId)},
             skipScreenGaps: this._layout?.skipScreenGaps === true,
             activeMonitorSetKey: this._activeMonitorSetKey,
             lastLayoutSyncReason: this._lastLayoutSyncReason,
@@ -519,6 +536,46 @@ export default class TrueScreenImplementation {
         this._prepareForSleepId = 0;
     }
 
+    _cancelPendingRouting() {
+        this._cancelGuardRestore();
+        this._warpGuard = null;
+        if (this._pendingMotionWarpSourceId) {
+            GLib.Source.remove(this._pendingMotionWarpSourceId);
+            this._pendingMotionWarpSourceId = 0;
+        }
+        this._pendingMotionWarp = null;
+        this._barrierWarpPending = null;
+    }
+
+    _rememberActualPointer() {
+        const [x, y] = global.get_pointer();
+        const monitorIndex = findMonitor(monitorSnapshot(), x, y)?.index ?? null;
+        this._lastMonitorIndex = monitorIndex;
+        this._lastMotion = {x, y, monitorIndex};
+        return this._lastMotion;
+    }
+
+    _routingPausedForGrab() {
+        return this._windowGrabActive &&
+            (!this._windowMoveActive || this._dragRoutingFailed);
+    }
+
+    _setWindowGrabActive(active, op = Meta.GrabOp.MOVING) {
+        this._windowGrabActive = active;
+        this._windowMoveActive = active &&
+            (op === Meta.GrabOp.MOVING || op === Meta.GrabOp.MOVING_UNCONSTRAINED);
+        this._dragRoutingFailed = false;
+        this._routingEpoch++;
+        this._cancelPendingRouting();
+        this._ignoreMotionUntil = 0;
+        this._warpFailureUntil = 0;
+        this._rememberActualPointer();
+        // Start the new grab with fresh routing state. Window moves retain
+        // mapped passages, but never confine the drag with blocked passages.
+        if (this._enabled)
+            this._rebuildEdgeBarriers(monitorSnapshot(), this._layout);
+    }
+
     _destroyEdgeBarriers() {
         for (const entry of this._edgeBarriers ?? []) {
             if (entry.hitId)
@@ -535,7 +592,7 @@ export default class TrueScreenImplementation {
         this._edgeBarrierActions = [];
         this._edgeBarrierError = null;
         this._barriersSuspended = false;
-        if (layout?.enabled !== true)
+        if (layout?.enabled !== true || this._routingPausedForGrab())
             return;
 
         try {
@@ -543,7 +600,7 @@ export default class TrueScreenImplementation {
                 logicalMonitors: monitors,
                 physicalLayout: layout.monitors,
                 skipScreenGaps: layout.skipScreenGaps === true,
-            });
+            }).filter(spec => !this._windowGrabActive || spec.mode === 'warp');
             const geometry = trimBarrierGeometryFromCorners(
                 mergedBarrierGeometry(this._edgeBarrierActions),
                 monitors,
@@ -631,7 +688,9 @@ export default class TrueScreenImplementation {
         if (!this._enabled || this._layout?.enabled !== true)
             return;
 
-        if (this._barrierWarpPending !== null) {
+        if (this._routingPausedForGrab() ||
+            GLib.get_monotonic_time() < this._warpFailureUntil ||
+            this._barrierWarpPending !== null) {
             this._releaseBarrierEvent(entry.barrier, event);
             return;
         }
@@ -713,6 +772,10 @@ export default class TrueScreenImplementation {
         }
 
         const blockPointer = () => {
+            if (this._windowGrabActive) {
+                this._releaseBarrierEvent(barrier, event);
+                return;
+            }
             this._routeAttempts++;
             this._barrierHits++;
             this._blockedEdgeHits++;
@@ -780,6 +843,7 @@ export default class TrueScreenImplementation {
             delta: {x: event.dx, y: event.dy, source: 'meta-barrier'},
             sourceCoordinate: {x: event.x, y: event.y},
         });
+        const routingEpoch = this._routingEpoch;
         this._barrierWarpPending = routeRecord.serial;
         // Release this native event sequence before warping. Destroying a
         // Meta.Barrier from inside its own `hit` callback can leave Mutter's
@@ -787,10 +851,12 @@ export default class TrueScreenImplementation {
         // when the user immediately reverses direction.
         this._releaseBarrierEvent(barrier, event);
         GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
-            if (!this._enabled)
+            if (!this._enabled || routingEpoch !== this._routingEpoch)
                 return GLib.SOURCE_REMOVE;
             this._suspendEdgeBarriers();
             GLib.idle_add(GLib.PRIORITY_DEFAULT_IDLE, () => {
+                if (!this._enabled || routingEpoch !== this._routingEpoch)
+                    return GLib.SOURCE_REMOVE;
                 if (this._enabled) {
                     this._warpAndRemember(
                         route.x,
@@ -802,6 +868,8 @@ export default class TrueScreenImplementation {
                 }
                 this._barrierWarpPending = 'cooldown';
                 GLib.timeout_add(GLib.PRIORITY_DEFAULT, 12, () => {
+                    if (!this._enabled || routingEpoch !== this._routingEpoch)
+                        return GLib.SOURCE_REMOVE;
                     this._barrierWarpPending = null;
                     if (this._enabled)
                         this._resumeEdgeBarriers();
@@ -854,6 +922,8 @@ export default class TrueScreenImplementation {
         routeRecord = null,
         createGuard = true,
     ) {
+        if (!this._enabled || this._routingPausedForGrab())
+            return false;
         const target = monitorSnapshot().find(
             monitor => monitor.index === monitorIndex,
         );
@@ -881,12 +951,50 @@ export default class TrueScreenImplementation {
         // A pointer warp emits another motion event. Ignore routing briefly so
         // that event cannot recursively warp while Clutter is dispatching it.
         this._ignoreMotionUntil = now + 8_000;
+        // Warp-back and guard restores also need unconstrained motion. Leaving
+        // our own opposite-direction barrier active can clamp the warp to a
+        // seam/corner and start an endless correction loop.
+        if (this._edgeBarriers.length > 0) {
+            const routingEpoch = this._routingEpoch;
+            this._suspendEdgeBarriers();
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 12, () => {
+                if (this._enabled && routingEpoch === this._routingEpoch)
+                    this._resumeEdgeBarriers();
+                return GLib.SOURCE_REMOVE;
+            });
+        }
         this._seat.warp_pointer(targetX, targetY);
+        // Mutter may apply the warp after this dispatch. Verify after settling,
+        // and only if routing still remembers this requested destination.
+        const routingEpoch = this._routingEpoch;
+        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 25, () => {
+            if (!this._enabled || routingEpoch !== this._routingEpoch ||
+                this._lastMotion?.monitorIndex !== monitorIndex ||
+                this._lastMotion.x !== targetX || this._lastMotion.y !== targetY)
+                return GLib.SOURCE_REMOVE;
+            const [actualX, actualY] = global.get_pointer();
+            const actualIndex = findMonitor(monitorSnapshot(), actualX, actualY)?.index ?? null;
+            if (actualIndex !== monitorIndex) {
+                this._cancelPendingRouting();
+                const actual = this._rememberActualPointer();
+                this._warpFailureUntil = GLib.get_monotonic_time() + 250_000;
+                if (this._windowGrabActive) {
+                    this._dragRoutingFailed = true;
+                    this._routingEpoch++;
+                    this._destroyEdgeBarriers();
+                }
+                if (routeRecord) {
+                    routeRecord.warpRefused = 'compositor-constrained';
+                    routeRecord.actualPointer = {...actual};
+                }
+            }
+            return GLib.SOURCE_REMOVE;
+        });
         this._lastMonitorIndex = monitorIndex;
         this._lastMotion = {x: targetX, y: targetY, monitorIndex};
         const guardDirection = routeRecord?.guardDirection ??
             routeRecord?.direction;
-        if (createGuard && guardDirection) {
+        if (createGuard && guardDirection && !this._windowGrabActive) {
             this._cancelGuardRestore();
             this._warpGuard = {
                 sourceIndex: routeRecord.sourceIndex,
@@ -1025,6 +1133,11 @@ export default class TrueScreenImplementation {
         const now = GLib.get_monotonic_time();
 
         this._motionEvents++;
+        if (this._routingPausedForGrab() || now < this._warpFailureUntil) {
+            this._lastMonitorIndex = monitor?.index ?? null;
+            this._lastMotion = {x, y, monitorIndex: monitor?.index ?? null};
+            return Clutter.EVENT_PROPAGATE;
+        }
         if (this._barrierWarpPending !== null)
             return Clutter.EVENT_PROPAGATE;
 
@@ -1096,7 +1209,7 @@ export default class TrueScreenImplementation {
                     );
                     return Clutter.EVENT_PROPAGATE;
                 }
-                if (route.action === 'block') {
+                if (route.action === 'block' && !this._windowGrabActive) {
                     this._blockedEdgeHits++;
                     const rejection = rejectNativeTransition({
                         logicalMonitors: monitors,
@@ -1164,7 +1277,7 @@ export default class TrueScreenImplementation {
                 );
                 return Clutter.EVENT_PROPAGATE;
             }
-            if (edgeRoute.action === 'block') {
+            if (edgeRoute.action === 'block' && !this._windowGrabActive) {
                 const rejection = rejectNativeTransition({
                     logicalMonitors: monitors,
                     sourceIndex: monitor.index,

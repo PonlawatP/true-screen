@@ -25,6 +25,21 @@ related_states: []
 
 ## Business Rules
 
+- Pointer-driven window moves retain mapped crossings, including optional gap
+  skipping, so the window follows the warped pointer throughout a held-button
+  drag. During moves, unmapped passages use native movement rather than blocking
+  barriers, warp-back or post-warp restore guards. Resize and keyboard grabs
+  continue to use native movement.
+- Grab start cancels old motion/guard warps and invalidates deferred native
+  crossings; grab end resumes from the actual pointer without changing saved
+  settings. Reloads preserve the grab's routing policy. A compositor-refused
+  drag warp disables corrections only until that grab ends, preventing retries
+  from trapping the pointer while retaining crossing support for the next drag.
+- All pointer corrections temporarily release extension-owned barriers. After
+  the compositor settles, a destination-monitor mismatch with the remembered
+  request cancels correction state, adopts the actual pointer and backs off
+  routing for 250 ms instead of repeatedly warping to an unreachable screen.
+
 - Optional `skipScreenGaps: true` extends routing to the nearest forward screen intersecting the physical pointer ray in all four directions. Nearer screens occlude farther ones; no matching screen means no jump. Barriers, edge pushes, and native-transition fallback share this policy. Missing or false retains adjacent-only routing.
 
 - The GNOME Shell extension selects the schema-version-1 profile matching the
@@ -112,3 +127,7 @@ related_states: []
 | 2026-09-07 | Added optional nearest-screen gap crossing with physical-coordinate preservation, occlusion-aware barriers, and native fallback target guards; unit and headless Shell coverage; status: stable for gap-crossing scope. Physical lock/resume cycling remains a prior manual verification item. |
 
 | 2026-09-07 | Fixed continuous edge sliding and chained crossings: removed blocked-event latching, routed diagonal native hits by barrier normal, and cleared superseded guards/restores. Headless regressions cover a single event sequence moving from blocked to mapped and stale guard replacement; status: stable. |
+
+| 2026-09-07 | Fixed window-drag corner confinement loops: suspend routing during Mutter grabs, cancel deferred crossings, release own barriers for corrections, and verify settled warp destinations with failure recovery. Headless tests cover grab cancellation/resume, reload during grabs and refused-warp loops; status: stable. |
+
+| 2026-09-07 | Restored mapped pointer-driven window dragging, including gap crossings, with native fallback for blocked passages and per-grab refusal recovery. Verified a real GTK window moves forward and backward across a physical gap within one held-button Mutter grab; resize remains native; status: stable. |

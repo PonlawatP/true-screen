@@ -96,3 +96,7 @@ related_states: []
 | 2026-08-28 | Routed saved-layout collision repair through current logical monitor order so the live Built-in–Dell–Samsung topology persists without overlap across app restarts; status: stable. |
 
 | 2026-09-07 | Added the Skip screen gaps draft toggle, serialization default, profile persistence coverage, and usage documentation; status: stable. |
+
+| 2026-09-07 | Documented temporary native cursor movement during window move/resize; saved remap and gap settings remain unchanged; status: stable. |
+
+| 2026-09-07 | Updated usage guidance: pointer-driven window moves retain mapped/gap crossings with native fallback, while resize and keyboard grabs remain native; saved settings are unchanged; status: stable. |

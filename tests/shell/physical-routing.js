@@ -1,5 +1,7 @@
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
+import Meta from 'gi://Meta';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
@@ -70,7 +72,7 @@ export async function run() {
         JSON.stringify(layout),
     );
     instance._implementation._loadLayout();
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 80; attempt++) {
         const state = JSON.parse(instance.GetState());
         if (state.routingEnabled && state.desktopRulerActors === 2)
             break;
@@ -84,8 +86,11 @@ export async function run() {
     expect(Object.values(initialState.lifecycleWatchers).every(Boolean),
         `Extension lifecycle watchers are incomplete: ` +
         `${JSON.stringify(initialState.lifecycleWatchers)}`);
+    // Allow the initial file-monitor notification to settle before asserting
+    // a separate lifecycle sync reason.
+    await delay(100);
     instance._implementation._scheduleLifecycleSync('integration-lifecycle', [0]);
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 80; attempt++) {
         const state = JSON.parse(instance.GetState());
         if (state.lastLayoutSyncReason === 'integration-lifecycle' &&
             state.lastLayoutSyncStatus === 'matched')
@@ -143,6 +148,12 @@ export async function run() {
     await Scripting.waitLeisure();
     await delay(20);
 
+    for (let attempt = 0; attempt < 30; attempt++) {
+        const state = JSON.parse(instance.GetState());
+        if (!state.barrierWarpPending && !state.barriersSuspended)
+            break;
+        await delay(10);
+    }
     const mappedState = JSON.parse(instance.GetState());
     const mappedSourceY = mappedState.lastRoute?.mode === 'barrier'
         ? mappedState.lastRoute.sourceCoordinate.y
@@ -457,7 +468,7 @@ export async function run() {
         JSON.stringify(separatedLayout),
     );
     implementation._loadLayout();
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 80; attempt++) {
         const state = JSON.parse(instance.GetState());
         if (state.lastLayoutSyncReason === 'manual' &&
             state.lastLayoutSyncStatus === 'matched' &&
@@ -498,7 +509,7 @@ export async function run() {
         JSON.stringify({...separatedLayout, skipScreenGaps: true}),
     );
     implementation._loadLayout();
-    for (let attempt = 0; attempt < 20; attempt++) {
+    for (let attempt = 0; attempt < 80; attempt++) {
         if (JSON.parse(instance.GetState()).skipScreenGaps)
             break;
         await delay(25);
@@ -558,6 +569,7 @@ export async function run() {
     await Scripting.waitLeisure();
     expect(implementation._lastRoute.action === 'block',
         'Sliding regression did not start on a closed edge');
+    await delay(20);
     implementation._onBarrierHit(slidingEntry, {
         event_id: 987654, x: seamX, y: slideY, dx: 2, dy: -20,
     });
@@ -580,9 +592,185 @@ export async function run() {
         implementation._pendingGuardRestoreSourceId === 0,
     'New crossing retained a stale guard or queued restore from the previous screen');
 
+    expect(Object.values(JSON.parse(instance.GetState()).grabWatchers).every(Boolean),
+        'Window-grab lifecycle signals were not registered');
+    implementation._queueMotionWarp(source.x + 20, sourceY, source.index);
+    implementation._setWindowGrabActive(true);
+    expect(implementation._pendingMotionWarpSourceId === 0 &&
+        implementation._warpGuard === null,
+    'Window move retained pre-grab corrections');
+    expect(implementation._edgeBarriers.length > 0 &&
+        implementation._edgeBarrierActions.every(action => action.mode === 'warp'),
+    'Window move lost mapped passages or retained blocking barriers');
+    implementation._rebuildEdgeBarriers(monitors, implementation._layout);
+    expect(implementation._edgeBarriers.length > 0 &&
+        implementation._edgeBarrierActions.every(action => action.mode === 'warp'),
+    'Layout reload did not retain move-compatible routing');
+
+    implementation._lastMotion = {x: seamX - 2, y: slideY, monitorIndex: source.index};
+    implementation._onBarrierHit(slidingEntry, {
+        x: seamX, y: slideY, dx: 2, dy: -20,
+    });
+    await delay(50);
+    expect(implementation._lastRoute.action === 'warp' &&
+        implementation._lastRoute.targetIndex === target.index &&
+        implementation._warpGuard === null,
+    'Mapped window-drag crossing did not warp without a restore guard');
+    const blockedWarpsBefore = implementation._warps;
+    implementation._lastMotion = {x: seamX - 2, y: closedY, monitorIndex: source.index};
+    implementation._onEvent({
+        type: () => Clutter.EventType.MOTION,
+        get_coords: () => [target.x + 20, closedY],
+    }, null);
+    expect(implementation._warps === blockedWarpsBefore &&
+        implementation._lastMotion.monitorIndex === target.index,
+    'An unmapped drag passage triggered warp-back instead of native movement');
+    implementation._setWindowGrabActive(false);
+
+    // Resize grabs still use native movement, and invalidate queued crossings.
+    implementation._lastMotion = {x: seamX - 2, y: slideY, monitorIndex: source.index};
+    implementation._onBarrierHit(slidingEntry, {
+        x: seamX, y: slideY, dx: 2, dy: 0,
+    });
+    implementation._setWindowGrabActive(true, Meta.GrabOp.RESIZING_E);
+    const resizeStart = global.get_pointer().slice(0, 2);
+    await delay(40);
+    expect(global.get_pointer()[0] === resizeStart[0] &&
+        global.get_pointer()[1] === resizeStart[1] &&
+        implementation._edgeBarriers.length === 0,
+    'Deferred crossing survived resize-grab start');
+    implementation._setWindowGrabActive(false);
+
+    // Reproduce the live loop: the compositor refuses to leave the current
+    // monitor, although warp_pointer itself returns without an error.
+    implementation._setWindowGrabActive(true);
+    const actualBeforeRefusal = implementation._rememberActualPointer();
+    const refusedMonitor = actualBeforeRefusal.monitorIndex === source.index ? target : source;
+    const realSeat = implementation._seat;
+    const refusedRoute = {sourceIndex: actualBeforeRefusal.monitorIndex, direction: 'left'};
+    try {
+        implementation._seat = {warp_pointer() {}};
+        const warped = implementation._warpAndRemember(
+            refusedMonitor.x + 20, refusedMonitor.y + 20, refusedMonitor.index,
+            refusedRoute);
+        await delay(40);
+        expect(warped === true && refusedRoute.warpRefused === 'compositor-constrained',
+            'Compositor refusal was recorded as a successful warp');
+        expect(implementation._lastMotion.monitorIndex === actualBeforeRefusal.monitorIndex &&
+            implementation._warpGuard === null,
+        'Refused warp retained a fictional source monitor or restore guard');
+        const attemptsAfterRefusal = implementation._routeAttempts;
+        for (let motion = 0; motion < 20; motion++) {
+            implementation._onEvent({
+                type: () => Clutter.EventType.MOTION,
+                get_coords: () => [actualBeforeRefusal.x, actualBeforeRefusal.y],
+            }, null);
+        }
+        expect(implementation._routeAttempts === attemptsAfterRefusal &&
+            implementation._dragRoutingFailed && implementation._edgeBarriers.length === 0,
+            'Refused warp entered a repeated correction loop');
+    } finally {
+        implementation._seat = realSeat;
+        implementation._setWindowGrabActive(false);
+    }
+
+    // Exercise a real GTK window and Mutter move grab, not only event-shaped
+    // stubs. A held-button drag must carry both pointer and window across a gap.
+    const launcher = new Gio.SubprocessLauncher({flags: Gio.SubprocessFlags.NONE});
+    launcher.setenv('GDK_BACKEND', 'wayland', true);
+    const client = launcher.spawnv(['gjs', '-c', `
+        imports.gi.versions.Gtk = '4.0';
+        const Gtk = imports.gi.Gtk;
+        const app = new Gtk.Application({application_id: 'io.plutostudio.TrueScreen.DragTest'});
+        app.connect('activate', () => {
+            const window = new Gtk.ApplicationWindow({application: app,
+                title: 'True Screen Drag Regression', default_width: 400, default_height: 240});
+            window.set_child(new Gtk.Label({label: 'Drag across the physical gap'}));
+            window.present();
+        });
+        app.run([]);
+    `]);
+    let dragWindow = null;
+    const liveDrag = {};
+    try {
+        for (let attempt = 0; attempt < 80; attempt++) {
+            dragWindow = global.get_window_actors().map(actor => actor.meta_window)
+                .find(window => window.get_title() === 'True Screen Drag Regression');
+            if (dragWindow)
+                break;
+            await delay(25);
+        }
+        expect(dragWindow !== null && dragWindow !== undefined,
+            'GTK drag test window did not appear');
+        GLib.file_set_contents(
+            GLib.build_filenamev([configDir, 'layout.json']),
+            JSON.stringify({...separatedLayout, skipScreenGaps: true}),
+        );
+        implementation._loadLayout();
+        await delay(100);
+        dragWindow.move_frame(true, source.x + 300, source.y + 300);
+        dragWindow.activate(global.get_current_time());
+        await delay(75);
+        const frameBefore = dragWindow.get_frame_rect();
+        const dragX = frameBefore.x + 150;
+        const dragY = frameBefore.y + 50;
+        virtualPointer.notify_absolute_motion(GLib.get_monotonic_time(), dragX, dragY);
+        await delay(30);
+        virtualPointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.PRESSED);
+        await delay(30);
+        expect(dragWindow.begin_grab_op(Meta.GrabOp.MOVING,
+            Clutter.get_default_backend().get_pointer_sprite(global.stage),
+            global.get_current_time(), null), 'Mutter refused the test move grab');
+        expect(implementation._windowGrabActive && implementation._windowMoveActive,
+            'Real move grab did not activate drag routing');
+        virtualPointer.notify_absolute_motion(GLib.get_monotonic_time(), seamX + 60, dragY);
+        for (let attempt = 0; attempt < 40; attempt++) {
+            await delay(25);
+            if (global.get_pointer()[0] >= target.x &&
+                dragWindow.get_monitor() === target.index &&
+                !implementation._barrierWarpPending)
+                break;
+        }
+        const [forwardX, forwardY] = global.get_pointer();
+        const frameAfter = dragWindow.get_frame_rect();
+        expect(forwardX >= target.x && forwardX < target.x + target.width &&
+            frameAfter.x > frameBefore.x + 500 &&
+            dragWindow.get_monitor() === target.index,
+        `Held-button gap drag did not carry window and pointer: ` +
+            `${JSON.stringify({forwardX, forwardY, frameBefore, frameAfter})}`);
+        expect(implementation._windowGrabActive && !implementation._dragRoutingFailed,
+            'Gap crossing ended or disabled the active move grab');
+        liveDrag.forward = {pointer: {x: forwardX, y: forwardY}, windowX: frameAfter.x};
+        virtualPointer.notify_absolute_motion(GLib.get_monotonic_time(), seamX - 60, forwardY);
+        for (let attempt = 0; attempt < 40; attempt++) {
+            await delay(25);
+            if (global.get_pointer()[0] < seamX &&
+                dragWindow.get_monitor() === source.index &&
+                !implementation._barrierWarpPending)
+                break;
+        }
+        const [reverseX, reverseY] = global.get_pointer();
+        expect(reverseX < seamX && dragWindow.get_monitor() === source.index &&
+            implementation._windowGrabActive,
+            'Continuous reverse drag did not return window and pointer to source: ' +
+                JSON.stringify({reverseX, reverseY, frame: dragWindow.get_frame_rect(),
+                    windowMonitor: dragWindow.get_monitor(), state: JSON.parse(instance.GetState())}));
+        liveDrag.reverse = {pointer: {x: reverseX, y: reverseY},
+            windowX: dragWindow.get_frame_rect().x};
+        virtualPointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.RELEASED);
+        await delay(50);
+        expect(!implementation._windowGrabActive,
+            'Button release did not finish the real move grab');
+    } finally {
+        virtualPointer.notify_button(GLib.get_monotonic_time(), 1, Clutter.ButtonState.RELEASED);
+        dragWindow?.delete(global.get_current_time());
+        client.force_exit();
+    }
+
     const result = {
         passed: true,
         activeMonitors: monitors.length,
+        liveDrag,
         source: {index: source.index, x: sourceX, y: sourceY},
         observedSource,
         barrierFreeSafeMode: {

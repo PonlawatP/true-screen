@@ -73,7 +73,11 @@ horizontal position for vertical movement). For example, the upper part of a
 tall left screen can lead directly to a right screen above a shorter middle
 screen. Where the middle screen intersects that path, the cursor enters it
 normally. With no screen along the path, the edge remains closed. The setting
-is off by default and is saved per monitor profile.
+is off by default and is saved per monitor profile. While dragging a window with the
+pointer, mapped crossings and gap skipping stay active so the window follows
+across screens. Unmapped passages use normal GNOME movement without pulling the
+pointer back. If GNOME refuses a drag warp, correction pauses for that drag and
+resumes after release. Resizing and keyboard move/resize use native movement.
 
 Layouts are saved separately for each exact set of connected physical monitor
 identities. Connector names are not part of the stable identity, so a display
