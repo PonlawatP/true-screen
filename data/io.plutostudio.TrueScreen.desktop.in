@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=True Screen
+Comment=Arrange monitors by their real-world physical size
+Exec="@EXEC@"
+Icon=io.plutostudio.TrueScreen
+Terminal=false
+Categories=Settings;GTK;
+StartupNotify=true
+DBusActivatable=false

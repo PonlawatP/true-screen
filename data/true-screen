@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+install_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+exec gjs -m "${install_root}/app/main.js"
+

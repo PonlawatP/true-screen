@@ -1,0 +1,8 @@
+{
+  "uuid": "true-screen@plutostudio.io",
+  "name": "True Screen",
+  "description": "Physical monitor layout, cursor remapping, and desktop ruler overlay for GNOME Wayland.",
+  "shell-version": ["50"],
+  "url": "https://github.com/plutostudio/true-screen",
+  "version": 4
+}

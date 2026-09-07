@@ -1,0 +1,3 @@
+# Feature Books local state (transient — do not commit)
+.fb-autobook.json
+.fb-autobook-baselines.json
